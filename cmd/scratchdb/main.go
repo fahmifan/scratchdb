@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,14 +21,26 @@ var (
 
 func main() {
 	if err := run(os.Args, os.Stdout); err != nil {
+		fmt.Fprint(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }
 
 // run the repl
-func run(args []string, wr io.Writer) error {
+func run(args []string, wr io.Writer) (err error) {
+	table, err := openDB("scratch.db")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		fmt.Println("DEBUG >>> table >>> NumRows >>> ", table.NumRows)
+		if err = table.Close(); err != nil {
+			fmt.Println("Error: ", err)
+			return
+		}
+	}()
+
 	rd := bufio.NewReader(os.Stdin)
-	table := &Table{}
 	for {
 		Print(wr, "db > ")
 		in, err := rd.ReadString('\n')
@@ -85,17 +98,101 @@ const (
 
 type Table struct {
 	NumRows uint32
-	Pages   [TableMaxPages][]byte
+	Pager   *Pager
+}
+
+func (t *Table) Close() error {
+	defer t.Pager.File.Sync()
+	defer t.Pager.File.Close()
+
+	for i := uint32(0); i < t.NumRows; i++ {
+		buf, slot := rowSlot(t, i)
+		t.Pager.File.WriteAt(buf, int64(slot))
+	}
+
+	return nil
+}
+
+type Pager struct {
+	File  *os.File
+	Pages [TableMaxPages][]byte
+}
+
+func openDB(fileName string) (*Table, error) {
+	pager, err := openPager(fileName)
+	if err != nil {
+		return nil, err
+	}
+	fstat, err := pager.File.Stat()
+	if err != nil {
+		return nil, err
+	}
+	numRows := uint32(fstat.Size()) / RowSize
+	table := Table{Pager: pager, NumRows: numRows}
+	return &table, nil
+}
+
+func openPager(fileName string) (*Pager, error) {
+	dbFile, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, os.ModePerm)
+	if err != nil {
+		return nil, err
+	}
+
+	pager := Pager{File: dbFile}
+
+	return &pager, nil
+}
+
+var ErrFail = errors.New("failure")
+
+func getPage(pager *Pager, pageNum uint32) ([]byte, error) {
+	if pageNum > TableMaxPages {
+		return nil, ErrFail
+	}
+
+	if pager.Pages[pageNum] == nil {
+		pager.Pages[pageNum] = make([]byte, PageSize)
+		fstat, err := pager.File.Stat()
+		fsize := uint32(fstat.Size())
+		if err != nil {
+			return nil, err
+		}
+
+		fmt.Println("DEBUG >>> fsize >>> ", fsize)
+		numPages := fsize / PageSize
+		if fsize%PageSize == 0 {
+			numPages++
+		}
+		fmt.Println("DEBUG >>> numPages >>> ", numPages)
+
+		if pageNum <= uint32(numPages) {
+			whence := 0
+			_, err := pager.File.Seek(int64(pageNum*PageSize), whence)
+			if err != nil {
+				return nil, err
+			}
+
+			_, err = pager.File.Read(pager.Pages[pageNum])
+			if err != nil && err != io.EOF {
+				return nil, err
+			}
+
+		}
+	}
+
+	return pager.Pages[pageNum], nil
 }
 
 func rowSlot(table *Table, rowNum uint32) (page []byte, slot uint32) {
 	pageNum := rowNum / RowsPerPage
-	if table.Pages[pageNum] == nil {
-		table.Pages[pageNum] = make([]byte, PageSize)
+	page, err := getPage(table.Pager, pageNum)
+	if err != nil {
+		// TODO: handled later
+		panic(err)
 	}
 	rowOffset := rowNum % RowsPerPage
 	bytesOffset := rowOffset * RowSize
-	return table.Pages[pageNum], bytesOffset
+	return page, bytesOffset
 }
 
 func executeStatement(wr io.Writer, stmt Statement, table *Table) {
@@ -112,16 +209,17 @@ type ExecuteResult int
 const (
 	ExecuteTableFull ExecuteResult = iota + 1
 	ExecuteSuccess
+	ExecuteFail
 )
 
 func serializeRow(row *Row, page []byte, slot uint32) {
-	binary.BigEndian.PutUint32(page[slot+IDOffset:], row.ID)
+	binary.LittleEndian.PutUint32(page[slot+IDOffset:], row.ID)
 	copy(page[slot+UsernameOffset:slot+EmailOffset], []byte(row.Username))
 	copy(page[slot+EmailOffset:slot+RowSize], []byte(row.Email))
 }
 
 func deserializeRow(page []byte, slot uint32, row *Row) {
-	row.ID = binary.BigEndian.Uint32(page[slot+IDOffset:])
+	row.ID = binary.LittleEndian.Uint32(page[slot+IDOffset:])
 	row.Username = string(trimNilBuf(page[slot+UsernameOffset : slot+EmailOffset]))
 	row.Email = string(trimNilBuf(page[slot+EmailOffset : slot+RowSize]))
 }
